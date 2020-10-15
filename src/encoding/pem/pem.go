@@ -9,12 +9,47 @@ package pem
 
 import (
 	"bytes"
+	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
 )
+
+// Some types to help decode encrypted PEM blocks
+
+type kdfAlgorithmIdentifierSpec struct {
+	Salt           []byte
+	IterationCount int
+}
+
+type kdfAlgorithmIdentifier struct {
+	KDFAlgo asn1.ObjectIdentifier
+	Spec    kdfAlgorithmIdentifierSpec
+}
+
+type cipherAlgorithmIdentifier struct {
+	CipherAlgo asn1.ObjectIdentifier
+	IV         []byte
+}
+
+type encryptionAlgorithmIdentifierSpec struct {
+	KeyDerivationFunc kdfAlgorithmIdentifier
+	EncryptionScheme  cipherAlgorithmIdentifier
+}
+
+type encryptionAlgorithmIdentifier struct {
+	PBES2 asn1.ObjectIdentifier
+	Spec  encryptionAlgorithmIdentifierSpec
+}
+
+type pbes2 struct {
+	EncryptionAlgorithm encryptionAlgorithmIdentifier
+	EncryptedData       []byte
+}
 
 // A Block represents a PEM encoded structure.
 //
@@ -170,6 +205,39 @@ func Decode(data []byte) (p *Block, rest []byte) {
 		return decodeError(data, rest)
 	}
 	p.Bytes = p.Bytes[:n]
+
+	if p.Type == "ENCRYPTED PRIVATE KEY" {
+		if len(p.Headers) != 0 {
+			return decodeError(data, rest)
+		}
+
+		var mypbes2 pbes2
+		extraBytes, err := asn1.Unmarshal(p.Bytes, &mypbes2)
+		if err != nil || len(extraBytes) > 0 {
+			return decodeError(data, rest)
+		}
+		mykdfalgos := map[string]string{
+			"1.2.840.113549.1.5.12": "PBKDF2",
+		}
+		mykdfalgo, ok := mykdfalgos[mypbes2.EncryptionAlgorithm.Spec.KeyDerivationFunc.KDFAlgo.String()]
+		if !ok {
+			decodeError(data, rest)
+		}
+		kdfHeader := mykdfalgo + "," + fmt.Sprintf("%d", mypbes2.EncryptionAlgorithm.Spec.KeyDerivationFunc.Spec.IterationCount) + "," + hex.EncodeToString(mypbes2.EncryptionAlgorithm.Spec.KeyDerivationFunc.Spec.Salt)
+		p.Headers["Key-Info"] = kdfHeader
+
+		myencalgos := map[string]string{
+			"2.16.840.1.101.3.4.1.2": "AES-128-CBC",
+		}
+		myencalgo, ok := myencalgos[mypbes2.EncryptionAlgorithm.Spec.EncryptionScheme.CipherAlgo.String()]
+		if !ok {
+			decodeError(data, rest)
+		}
+		encHeader := myencalgo + "," + hex.EncodeToString(mypbes2.EncryptionAlgorithm.Spec.EncryptionScheme.IV)
+		p.Headers["DEK-Info"] = encHeader
+
+		p.Bytes = mypbes2.EncryptedData
+	}
 
 	// the -1 is because we might have only matched pemEnd without the
 	// leading newline if the PEM block was empty.

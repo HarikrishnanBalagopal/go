@@ -13,11 +13,15 @@ import (
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/md5"
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
 type PEMCipher int
@@ -136,9 +140,38 @@ func DecryptPEMBlock(b *pem.Block, password []byte) ([]byte, error) {
 		return nil, errors.New("x509: incorrect IV size")
 	}
 
-	// Based on the OpenSSL implementation. The salt is the first 8 bytes
-	// of the initialization vector.
-	key := ciph.deriveKey(password, iv[:8])
+	var key []byte
+	if kdfInfo, ok := b.Headers["Key-Info"]; ok {
+		// PKCS8 or Openssh private key format
+		idx := strings.Index(kdfInfo, ",")
+		if idx == -1 {
+			return nil, errors.New("x509: malformed Key-Info header")
+		}
+		kdfName, kdfInfoRest := kdfInfo[:idx], kdfInfo[idx+1:]
+		idx = strings.Index(kdfInfoRest, ",")
+		if idx == -1 {
+			return nil, errors.New("x509: malformed Key-Info header")
+		}
+		iterationsStr, saltStr := kdfInfoRest[:idx], kdfInfoRest[idx+1:]
+
+		if kdfName != "PBKDF2" {
+			return nil, errors.New("x509: unsupported key derivation function")
+		}
+		iterations, err := strconv.Atoi(iterationsStr)
+		if err != nil || iterations <= 0 {
+			return nil, errors.New("x509: invalid iteration count")
+		}
+		salt, err := hex.DecodeString(saltStr)
+		if err != nil {
+			return nil, errors.New("x509: invalid salt")
+		}
+		key = pbkdf2.Key(password, salt, iterations, ciph.keySize, sha1.New)
+
+	} else {
+		// Based on the OpenSSL implementation. The salt is the first 8 bytes
+		// of the initialization vector.
+		key = ciph.deriveKey(password, iv[:8])
+	}
 	block, err := ciph.cipherFunc(key)
 	if err != nil {
 		return nil, err
